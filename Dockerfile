@@ -1,11 +1,11 @@
 FROM node:18
 
-# Instalar yt-dlp y ffmpeg (necesarios para descargas de audio)
+# Instalar yt-dlp y ffmpeg
 RUN apt-get update && apt-get install -y \
     python3 \
     python3-pip \
     ffmpeg \
-    && pip3 install --no-cache-dir yt-dlp \
+    && pip3 install --break-system-packages --no-cache-dir yt-dlp \
     && apt-get clean
 
 WORKDIR /app
@@ -19,7 +19,7 @@ RUN npm install
 # Copiar el código fuente
 COPY . .
 
-# Exponer el puerto (Railway usa PORT dinámico)
+# Exponer el puerto
 EXPOSE 8080
 
 # Comando para iniciar el servidor
