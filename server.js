@@ -4,7 +4,6 @@ const youtubedl = require('yt-dlp-exec');
 const redis = require('redis');
 const fs = require('fs');
 const path = require('path');
-const { promisify } = require('util');
 
 // Depuración: imprime la URL que está usando
 console.log('REDIS_URL:', process.env.REDIS_URL);
@@ -41,37 +40,69 @@ app.post('/api/song-url', async (req, res) => {
   try {
     let videoId = await client.get(searchKey);
 
+    // Buscar video si no está en caché
     if (!videoId) {
       const query = `${title} ${artist} audio`;
+      console.log(`🔍 Searching: ${query}`);
+      
       const result = await youtubedl(`ytsearch1:${query}`, {
         dumpSingleJson: true,
         defaultSearch: "ytsearch",
+        noCheckCertificates: true,
+        noWarnings: true,
+        preferFreeFormats: true,
+        addHeader: [
+          'referer:youtube.com',
+          'user-agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        ]
       });
+      
       const first = result.entries && result.entries[0];
       if (!first || !first.id) {
         return res.status(404).json({ error: 'No video found' });
       }
       videoId = first.id;
+      
+      // Cachear videoId por 7 días
       await client.set(searchKey, videoId, { EX: 604800 });
+      console.log(`✅ Cached videoId: ${videoId}`);
+    } else {
+      console.log(`📦 Using cached videoId: ${videoId}`);
     }
 
+    // IMPORTANTE: Siempre generar URL fresca (no cachear)
+    console.log(`🎵 Getting fresh stream URL for: ${videoId}`);
     const streamRes = await youtubedl(`https://www.youtube.com/watch?v=${videoId}`, {
       dumpSingleJson: true,
-      extractAudio: true,
-      audioFormat: "mp3",
+      format: 'bestaudio/best',
+      noCheckCertificates: true,
+      noWarnings: true,
+      preferFreeFormats: true,
+      addHeader: [
+        'referer:youtube.com',
+        'user-agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+      ]
     });
+    
     if (!streamRes.url) {
-      return res.status(404).json({ error: 'No audio found' });
+      return res.status(404).json({ error: 'No audio URL found' });
     }
 
+    console.log(`✅ Stream URL generated successfully`);
     res.json({
       url: streamRes.url,
       title: streamRes.title,
       videoUrl: streamRes.webpage_url,
+      duration: streamRes.duration,
+      thumbnail: streamRes.thumbnail
     });
+    
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Error finding audio', detail: err.message });
+    console.error('❌ Error in /api/song-url:', err.message);
+    res.status(500).json({ 
+      error: 'Error finding audio', 
+      detail: err.message 
+    });
   }
 });
 
@@ -90,10 +121,15 @@ app.post('/api/download', async (req, res) => {
 
     if (!videoId) {
       const query = `${title} ${artist} audio`;
+      console.log(`🔍 Searching for download: ${query}`);
+      
       const result = await youtubedl(`ytsearch1:${query}`, {
         dumpSingleJson: true,
         defaultSearch: "ytsearch",
+        noCheckCertificates: true,
+        noWarnings: true
       });
+      
       const first = result.entries && result.entries[0];
       if (!first || !first.id) {
         return res.status(404).json({ error: 'No video found' });
@@ -108,10 +144,16 @@ app.post('/api/download', async (req, res) => {
 
     await youtubedl(`https://www.youtube.com/watch?v=${videoId}`, {
       output: outputPath,
-      format: 'bestaudio',
+      format: 'bestaudio[ext=m4a]/bestaudio',
       extractAudio: true,
       audioFormat: 'mp3',
       audioQuality: 0,
+      noCheckCertificates: true,
+      noWarnings: true,
+      addHeader: [
+        'referer:youtube.com',
+        'user-agent:Mozilla/5.0'
+      ]
     });
 
     if (!fs.existsSync(outputPath)) {
@@ -142,8 +184,11 @@ app.post('/api/download', async (req, res) => {
     });
 
   } catch (err) {
-    console.error('Download error:', err);
-    res.status(500).json({ error: 'Error downloading', detail: err.message });
+    console.error('❌ Download error:', err.message);
+    res.status(500).json({ 
+      error: 'Error downloading', 
+      detail: err.message 
+    });
   }
 });
 
