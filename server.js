@@ -36,7 +36,7 @@ const BACKEND_URL = process.env.RAILWAY_PUBLIC_DOMAIN
   ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}` 
   : 'https://waike-production.up.railway.app';
 
-// ENDPOINT /api/song-url (MODIFICADO)
+// ENDPOINT /api/song-url
 app.post('/api/song-url', async (req, res) => {
   const { title, artist } = req.body;
   if (!title || !artist) {
@@ -82,7 +82,7 @@ app.post('/api/song-url', async (req, res) => {
 
     console.log(`✅ Stream URL generated: ${streamUrl}`);
     res.json({
-      url: streamUrl, // ← URL de tu backend como proxy
+      url: streamUrl,
       videoId: videoId,
       title: title,
       artist: artist
@@ -97,7 +97,7 @@ app.post('/api/song-url', async (req, res) => {
   }
 });
 
-// ENDPOINT /api/stream/:videoId (NUEVO - PROXY)
+// ENDPOINT /api/stream/:videoId (CON RETRY AUTOMÁTICO)
 app.get('/api/stream/:videoId', async (req, res) => {
   const { videoId } = req.params;
   
@@ -105,36 +105,57 @@ app.get('/api/stream/:videoId', async (req, res) => {
     return res.status(400).json({ error: 'Missing videoId' });
   }
 
-  try {
-    console.log(`🎵 Streaming audio for videoId: ${videoId}`);
+  // Función helper para intentar obtener el stream con reintentos
+  async function attemptStream(retryCount = 0) {
+    try {
+      console.log(`🎵 Streaming audio for videoId: ${videoId} (attempt ${retryCount + 1}/3)`);
 
-    // Obtener información del video y URL de stream
-    const info = await youtubedl(`https://www.youtube.com/watch?v=${videoId}`, {
-      dumpSingleJson: true,
-      format: 'bestaudio/best',
-      noCheckCertificates: true,
-      noWarnings: true,
-      preferFreeFormats: true,
-      addHeader: [
-        'referer:youtube.com',
-        'user-agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-      ]
-    });
+      // Obtener información del video y URL de stream
+      const info = await youtubedl(`https://www.youtube.com/watch?v=${videoId}`, {
+        dumpSingleJson: true,
+        format: 'bestaudio/best',
+        noCheckCertificates: true,
+        noWarnings: true,
+        preferFreeFormats: true,
+        addHeader: [
+          'referer:youtube.com',
+          'user-agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        ]
+      });
 
-    if (!info.url) {
-      return res.status(404).json({ error: 'No audio URL found' });
+      if (!info.url) {
+        throw new Error('No audio URL found');
+      }
+
+      return info.url;
+    } catch (err) {
+      // Si falla y no hemos agotado los reintentos (máximo 3 intentos)
+      if (retryCount < 2) {
+        console.log(`⚠️ Attempt ${retryCount + 1} failed: ${err.message}`);
+        console.log(`🔄 Retrying in 500ms...`);
+        await new Promise(resolve => setTimeout(resolve, 500)); // Espera 500ms
+        return attemptStream(retryCount + 1);
+      }
+      // Si agotamos los 3 intentos, lanzar el error
+      throw err;
     }
+  }
+
+  try {
+    // Intentar obtener URL del stream (con hasta 3 intentos)
+    const streamUrl = await attemptStream();
 
     console.log(`📡 Proxying stream from YouTube...`);
 
     // Determinar protocolo (http o https)
-    const protocol = info.url.startsWith('https') ? https : http;
+    const protocol = streamUrl.startsWith('https') ? https : http;
 
     // Hacer request al stream de YouTube
-    protocol.get(info.url, (audioStream) => {
+    protocol.get(streamUrl, (audioStream) => {
       // Configurar headers apropiados
       res.setHeader('Content-Type', 'audio/mpeg');
       res.setHeader('Accept-Ranges', 'bytes');
+      res.setHeader('Cache-Control', 'no-cache');
       
       if (audioStream.headers['content-length']) {
         res.setHeader('Content-Length', audioStream.headers['content-length']);
@@ -161,7 +182,7 @@ app.get('/api/stream/:videoId', async (req, res) => {
     });
 
   } catch (err) {
-    console.error('❌ Error streaming:', err.message);
+    console.error('❌ Error streaming after 3 attempts:', err.message);
     res.status(500).json({ 
       error: 'Error streaming audio', 
       detail: err.message 
