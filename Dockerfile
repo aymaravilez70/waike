@@ -1,11 +1,13 @@
 FROM node:18
 
-# Instalar yt-dlp, ffmpeg y crear symlink python -> python3
+# Instalar yt-dlp ACTUALIZADO, ffmpeg y crear symlink python -> python3
 RUN apt-get update && apt-get install -y \
     python3 \
     python3-pip \
     ffmpeg \
-    && pip3 install --break-system-packages --no-cache-dir yt-dlp \
+    curl \
+    && curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp \
+    && chmod a+rx /usr/local/bin/yt-dlp \
     && ln -s /usr/bin/python3 /usr/bin/python \
     && apt-get clean
 
