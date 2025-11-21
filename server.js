@@ -4,6 +4,8 @@ const youtubedl = require('yt-dlp-exec');
 const redis = require('redis');
 const fs = require('fs');
 const path = require('path');
+const https = require('https');
+const http = require('http');
 
 // Depuración: imprime la URL que está usando
 console.log('REDIS_URL:', process.env.REDIS_URL);
@@ -29,7 +31,12 @@ if (!fs.existsSync(TEMP_DIR)) {
   fs.mkdirSync(TEMP_DIR);
 }
 
-// ENDPOINT /api/song-url
+// Base URL del backend (Railway lo provee automáticamente)
+const BACKEND_URL = process.env.RAILWAY_PUBLIC_DOMAIN 
+  ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}` 
+  : 'https://waike-production.up.railway.app';
+
+// ENDPOINT /api/song-url (MODIFICADO)
 app.post('/api/song-url', async (req, res) => {
   const { title, artist } = req.body;
   if (!title || !artist) {
@@ -70,9 +77,39 @@ app.post('/api/song-url', async (req, res) => {
       console.log(`📦 Using cached videoId: ${videoId}`);
     }
 
-    // IMPORTANTE: Siempre generar URL fresca (no cachear)
-    console.log(`🎵 Getting fresh stream URL for: ${videoId}`);
-    const streamRes = await youtubedl(`https://www.youtube.com/watch?v=${videoId}`, {
+    // DEVOLVER URL DEL PROXY (no la URL directa de YouTube)
+    const streamUrl = `${BACKEND_URL}/api/stream/${videoId}`;
+
+    console.log(`✅ Stream URL generated: ${streamUrl}`);
+    res.json({
+      url: streamUrl, // ← URL de tu backend como proxy
+      videoId: videoId,
+      title: title,
+      artist: artist
+    });
+    
+  } catch (err) {
+    console.error('❌ Error in /api/song-url:', err.message);
+    res.status(500).json({ 
+      error: 'Error finding audio', 
+      detail: err.message 
+    });
+  }
+});
+
+// ENDPOINT /api/stream/:videoId (NUEVO - PROXY)
+app.get('/api/stream/:videoId', async (req, res) => {
+  const { videoId } = req.params;
+  
+  if (!videoId) {
+    return res.status(400).json({ error: 'Missing videoId' });
+  }
+
+  try {
+    console.log(`🎵 Streaming audio for videoId: ${videoId}`);
+
+    // Obtener información del video y URL de stream
+    const info = await youtubedl(`https://www.youtube.com/watch?v=${videoId}`, {
       dumpSingleJson: true,
       format: 'bestaudio/best',
       noCheckCertificates: true,
@@ -83,24 +120,50 @@ app.post('/api/song-url', async (req, res) => {
         'user-agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
       ]
     });
-    
-    if (!streamRes.url) {
+
+    if (!info.url) {
       return res.status(404).json({ error: 'No audio URL found' });
     }
 
-    console.log(`✅ Stream URL generated successfully`);
-    res.json({
-      url: streamRes.url,
-      title: streamRes.title,
-      videoUrl: streamRes.webpage_url,
-      duration: streamRes.duration,
-      thumbnail: streamRes.thumbnail
+    console.log(`📡 Proxying stream from YouTube...`);
+
+    // Determinar protocolo (http o https)
+    const protocol = info.url.startsWith('https') ? https : http;
+
+    // Hacer request al stream de YouTube
+    protocol.get(info.url, (audioStream) => {
+      // Configurar headers apropiados
+      res.setHeader('Content-Type', 'audio/mpeg');
+      res.setHeader('Accept-Ranges', 'bytes');
+      
+      if (audioStream.headers['content-length']) {
+        res.setHeader('Content-Length', audioStream.headers['content-length']);
+      }
+
+      // Pipe el stream de YouTube directamente al cliente
+      audioStream.pipe(res);
+
+      audioStream.on('error', (err) => {
+        console.error('❌ Audio stream error:', err.message);
+        if (!res.headersSent) {
+          res.status(500).json({ error: 'Stream error' });
+        }
+      });
+
+      audioStream.on('end', () => {
+        console.log(`✅ Stream completed for videoId: ${videoId}`);
+      });
+    }).on('error', (err) => {
+      console.error('❌ Request error:', err.message);
+      if (!res.headersSent) {
+        res.status(500).json({ error: 'Request error' });
+      }
     });
-    
+
   } catch (err) {
-    console.error('❌ Error in /api/song-url:', err.message);
+    console.error('❌ Error streaming:', err.message);
     res.status(500).json({ 
-      error: 'Error finding audio', 
+      error: 'Error streaming audio', 
       detail: err.message 
     });
   }
@@ -196,4 +259,5 @@ app.post('/api/download', async (req, res) => {
 const PORT = process.env.PORT || 5001;
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`✅ Backend running on port ${PORT}`);
+  console.log(`📡 Backend URL: ${BACKEND_URL}`);
 });
