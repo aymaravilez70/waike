@@ -97,7 +97,7 @@ app.post('/api/song-url', async (req, res) => {
   }
 });
 
-// ENDPOINT /api/stream/:videoId (CON RETRY AUTOMÁTICO)
+// ENDPOINT /api/stream/:videoId (MEJORADO - MEJOR MANEJO DE FORMATOS)
 app.get('/api/stream/:videoId', async (req, res) => {
   const { videoId } = req.params;
   
@@ -110,13 +110,15 @@ app.get('/api/stream/:videoId', async (req, res) => {
     try {
       console.log(`🎵 Streaming audio for videoId: ${videoId} (attempt ${retryCount + 1}/3)`);
 
-      // Obtener información del video y URL de stream
+      // MEJORA: Especificar formatos compatibles con expo-av
       const info = await youtubedl(`https://www.youtube.com/watch?v=${videoId}`, {
         dumpSingleJson: true,
-        format: 'bestaudio/best',
+        format: 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio', // Formatos más compatibles
         noCheckCertificates: true,
         noWarnings: true,
         preferFreeFormats: true,
+        extractAudio: true, // Asegurar que sea solo audio
+        audioFormat: 'best', // Mejor calidad de audio
         addHeader: [
           'referer:youtube.com',
           'user-agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
@@ -132,8 +134,8 @@ app.get('/api/stream/:videoId', async (req, res) => {
       // Si falla y no hemos agotado los reintentos (máximo 3 intentos)
       if (retryCount < 2) {
         console.log(`⚠️ Attempt ${retryCount + 1} failed: ${err.message}`);
-        console.log(`🔄 Retrying in 500ms...`);
-        await new Promise(resolve => setTimeout(resolve, 500)); // Espera 500ms
+        console.log(`🔄 Retrying in 1 second...`);
+        await new Promise(resolve => setTimeout(resolve, 1000)); // Aumentado a 1 segundo
         return attemptStream(retryCount + 1);
       }
       // Si agotamos los 3 intentos, lanzar el error
@@ -152,10 +154,11 @@ app.get('/api/stream/:videoId', async (req, res) => {
 
     // Hacer request al stream de YouTube
     protocol.get(streamUrl, (audioStream) => {
-      // Configurar headers apropiados
-      res.setHeader('Content-Type', 'audio/mpeg');
+      // MEJORA: Headers más compatibles
+      res.setHeader('Content-Type', 'audio/mpeg'); // Forzar MPEG para compatibilidad
       res.setHeader('Accept-Ranges', 'bytes');
       res.setHeader('Cache-Control', 'no-cache');
+      res.setHeader('Connection', 'keep-alive'); // Mantener conexión viva
       
       if (audioStream.headers['content-length']) {
         res.setHeader('Content-Length', audioStream.headers['content-length']);
