@@ -97,99 +97,178 @@ app.post('/api/song-url', async (req, res) => {
     }
 });
 
-// ENDPOINT /api/stream/:videoId (MEJORADO - MEJOR MANEJO DE FORMATOS)
+// --- HELPER FUNCIONS ---
+
+// Función centralizada para resolver y cachear URL (con Redis)
+// Se usa tanto en /stream (si falta caché) como en /pre-cache (prefetch)
+async function resolveAndCache(videoId) {
+    const streamKey = `stream_url:${videoId}`;
+
+    console.log(`🔄 Resolving fresh URL for ${videoId}...`);
+    const info = await youtubedl(`https://www.youtube.com/watch?v=${videoId}`, {
+        dumpSingleJson: true,
+        format: 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio',
+        noCheckCertificates: true,
+        noWarnings: true,
+        preferFreeFormats: true,
+        extractAudio: true,
+        addHeader: [
+            'referer:youtube.com',
+            'user-agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        ]
+    });
+
+    if (!info.url) throw new Error('No audio URL found');
+
+    // Cachear la URL real por 45 minutos
+    await client.set(streamKey, info.url, { EX: 2700 });
+    console.log(`✅ Cached stream URL for ${videoId} (TTL 45m)`);
+
+    return info.url;
+}
+
+// --- ENDPOINTS ---
+
+// NEW ENDPOINT: /api/pre-cache/:videoId (PREFETCH + LOCKING)
+// Este endpoint es llamado por el frontend 5s después de empezar una canción
+// para preparar la siguiente sin descargarla aún.
+app.post('/api/pre-cache/:videoId', async (req, res) => {
+    const { videoId } = req.params;
+    if (!videoId) return res.status(400).json({ error: 'Missing videoId' });
+
+    const streamKey = `stream_url:${videoId}`;
+    const lockKey = `resolving:${videoId}`;
+
+    try {
+        // 1. Check Cache
+        const exists = await client.exists(streamKey);
+        if (exists) {
+            console.log(`✨ Pre-cache Hit (Already cached): ${videoId}`);
+            return res.status(200).json({ status: 'cached' });
+        }
+
+        // 2. Check Lock (Concurrency Protection)
+        // SetNX devuelve true si seteó la key (no existía), false si ya existía
+        const isLocked = await client.set(lockKey, '1', { NX: true, EX: 30 }); // TTL 30s para el lock
+
+        if (!isLocked) {
+            console.log(`🔒 Resource locked (Already resolving): ${videoId}`);
+            return res.status(202).json({ status: 'resolving' }); // 202 Accepted
+        }
+
+        // 3. Resolve (Critical Section)
+        await resolveAndCache(videoId);
+
+        // 4. Release Lock
+        await client.del(lockKey);
+
+        res.status(200).json({ status: 'resolved' });
+
+    } catch (err) {
+        console.error(`❌ Pre-cache error for ${videoId}:`, err.message);
+        // Clean lock on error
+        await client.del(lockKey);
+        res.status(500).json({ error: 'Pre-cache failed' });
+    }
+});
+
+
+// ENDPOINT /api/stream/:videoId (OPTIMIZED - CACHING + RANGE SUPPORT)
 app.get('/api/stream/:videoId', async (req, res) => {
     const { videoId } = req.params;
+    const range = req.headers.range;
 
     if (!videoId) {
         return res.status(400).json({ error: 'Missing videoId' });
     }
 
-    // Función helper para intentar obtener el stream con reintentos
-    async function attemptStream(retryCount = 0) {
-        try {
-            console.log(`🎵 Streaming audio for videoId: ${videoId} (attempt ${retryCount + 1}/3)`);
+    const streamKey = `stream_url:${videoId}`;
 
-            // MEJORA: Especificar formatos compatibles con expo-av
-            const info = await youtubedl(`https://www.youtube.com/watch?v=${videoId}`, {
-                dumpSingleJson: true,
-                format: 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio', // Formatos más compatibles
-                noCheckCertificates: true,
-                noWarnings: true,
-                preferFreeFormats: true,
-                extractAudio: true, // Asegurar que sea solo audio
-                audioFormat: 'best', // Mejor calidad de audio
-                addHeader: [
-                    'referer:youtube.com',
-                    'user-agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-                ]
+    // Helper to pipe stream
+    function pipeStream(url, isRetry = false) {
+        const protocol = url.startsWith('https') ? https : http;
+
+        const options = {
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }
+        };
+
+        // Forward Range header if present
+        if (range) {
+            options.headers['Range'] = range;
+            // console.log(`⏩ Seeking: ${range}`);
+        }
+
+        const request = protocol.get(url, options, (streamRes) => {
+            // Check for valid response (YouTube returns 403 if URL expired)
+            if (streamRes.statusCode === 403 || streamRes.statusCode === 404) {
+                console.warn(`⚠️ Cached URL expired/invalid (${streamRes.statusCode})...`);
+                if (!isRetry) {
+                    // Retry with fresh URL logic
+                    // We invalidate cache explicitely here? 
+                    // resolveAndCache will overwrite old cache key.
+                    return resolveAndCache(videoId)
+                        .then(newUrl => pipeStream(newUrl, true))
+                        .catch(err => {
+                            console.error('❌ Retry failed:', err.message);
+                            if (!res.headersSent) res.status(500).json({ error: 'Retry failed' });
+                        });
+                } else {
+                    if (!res.headersSent) res.status(500).json({ error: 'Stream failed' });
+                    return;
+                }
+            }
+
+            // Forward crucial headers
+            const headersArgs = {
+                'Content-Type': 'audio/mpeg', // Force MPEG specifically for React Native Track Player/Expo AV
+                'Content-Length': streamRes.headers['content-length'],
+                'Content-Range': streamRes.headers['content-range'],
+                'Accept-Ranges': 'bytes',
+                'Cache-Control': 'no-cache'
+            };
+
+            // Only set headers that exist (avoid undefined)
+            Object.keys(headersArgs).forEach(key => {
+                if (headersArgs[key]) res.setHeader(key, headersArgs[key]);
             });
 
-            if (!info.url) {
-                throw new Error('No audio URL found');
+            // Set correct status code (206 for Partial Content, 200 for full)
+            if (streamRes.statusCode === 206 || streamRes.statusCode === 200) {
+                res.status(streamRes.statusCode);
             }
 
-            return info.url;
-        } catch (err) {
-            // Si falla y no hemos agotado los reintentos (máximo 3 intentos)
-            if (retryCount < 2) {
-                console.log(`⚠️ Attempt ${retryCount + 1} failed: ${err.message}`);
-                console.log(`🔄 Retrying in 1 second...`);
-                await new Promise(resolve => setTimeout(resolve, 1000)); // Aumentado a 1 segundo
-                return attemptStream(retryCount + 1);
-            }
-            // Si agotamos los 3 intentos, lanzar el error
-            throw err;
-        }
+            streamRes.pipe(res);
+
+            streamRes.on('end', () => {
+                // console.log(`✅ Stream finished: ${videoId}`);
+            });
+
+        }).on('error', (err) => {
+            console.error('❌ Request error:', err.message);
+            if (!res.headersSent) res.status(500).json({ error: 'Stream request error' });
+        });
     }
 
     try {
-        // Intentar obtener URL del stream (con hasta 3 intentos)
-        const streamUrl = await attemptStream();
+        // 3. Main Flow
+        // Try Cache First
+        let streamUrl = await client.get(streamKey);
 
-        console.log(`📡 Proxying stream from YouTube...`);
-
-        // Determinar protocolo (http o https)
-        const protocol = streamUrl.startsWith('https') ? https : http;
-
-        // Hacer request al stream de YouTube
-        protocol.get(streamUrl, (audioStream) => {
-            // MEJORA: Headers más compatibles
-            res.setHeader('Content-Type', 'audio/mpeg'); // Forzar MPEG para compatibilidad
-            res.setHeader('Accept-Ranges', 'bytes');
-            res.setHeader('Cache-Control', 'no-cache');
-            res.setHeader('Connection', 'keep-alive'); // Mantener conexión viva
-
-            if (audioStream.headers['content-length']) {
-                res.setHeader('Content-Length', audioStream.headers['content-length']);
-            }
-
-            // Pipe el stream de YouTube directamente al cliente
-            audioStream.pipe(res);
-
-            audioStream.on('error', (err) => {
-                console.error('❌ Audio stream error:', err.message);
-                if (!res.headersSent) {
-                    res.status(500).json({ error: 'Stream error' });
-                }
-            });
-
-            audioStream.on('end', () => {
-                console.log(`✅ Stream completed for videoId: ${videoId}`);
-            });
-        }).on('error', (err) => {
-            console.error('❌ Request error:', err.message);
-            if (!res.headersSent) {
-                res.status(500).json({ error: 'Request error' });
-            }
-        });
+        if (streamUrl) {
+            console.log(`⚡ Instant Play (Cache Hit): ${videoId}`);
+            pipeStream(streamUrl);
+        } else {
+            console.log(`🐢 Cache Miss: ${videoId}`);
+            // Use shared helper
+            streamUrl = await resolveAndCache(videoId);
+            pipeStream(streamUrl);
+        }
 
     } catch (err) {
-        console.error('❌ Error streaming after 3 attempts:', err.message);
-        res.status(500).json({
-            error: 'Error streaming audio',
-            detail: err.message
-        });
+        console.error('❌ Critical Error:', err.message);
+        if (!res.headersSent) res.status(500).json({ error: 'Server error' });
     }
 });
 
